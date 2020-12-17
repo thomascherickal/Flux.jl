@@ -10,29 +10,48 @@ _dropout_shape(s, dims) = tuple((i ∉ dims ? 1 : si for (i, si) ∈ enumerate(s
 _dropout_kernel(y::T, p, q) where {T} = y > p ? T(1 / q) : T(0)
 
 """
-    dropout(p, dims = :)
+    dropout(x, p; dims=:, active=true)
 
-Dropout function. For each input, either sets that input to `0` (with probability
-`p`) or scales it by `1/(1-p)`. The `dims` argument is to specify the unbroadcasted
-dimensions, i.e. `dims=1` does dropout along columns and `dims=2` along rows. This is
-used as a regularisation, i.e. it reduces overfitting during training. 
- 
-See also [`Dropout`](@ref).
+The dropout function. If `active` is `true`,
+for each input, either sets that input to `0` (with probability
+`p`) or scales it by `1 / (1 - p)`. `dims` specifies the unbroadcasted dimensions,
+e.g. `dims=1` applies dropout along columns and `dims=2` along rows.
+This is used as a regularisation, i.e. it reduces overfitting during training.
+
+If `active` is `false`, it just returns the input `x`
+
+Warning: when using this function, you have to manually manage the activation
+state. Usually in fact, dropout is used while training
+but is deactivated in the inference phase. This can be
+automatically managed using the [`Dropout`](@ref) layer instead of the
+`dropout` function.
+
+The [`Dropout`](@ref) layer is what you should use in most scenarios.
 """
-dropout(x, p; dims = :) = x
+function dropout(x, p; dims=:, active::Bool=true)
+  active || return x
+  y = dropout_mask(x, p, dims=dims)
+  return x .* y
+end
 
-@adjoint function dropout(x, p; dims = :)
-  y = rand!(similar(x, _dropout_shape(x, dims)))
-  y .= _dropout_kernel.(y, p, 1 - p)
+@adjoint function dropout(x, p; dims=:, active::Bool=true)
+  active || return x, Δ -> (Δ, nothing)
+  y = dropout_mask(x, p, dims=dims)
   return x .* y, Δ -> (Δ .* y, nothing)
 end
 
+function dropout_mask(x, p; dims=:)
+  y = rand!(similar(x, _dropout_shape(x, dims)))
+  y .= _dropout_kernel.(y, p, 1 - p)
+  return y
+end
+
 """
-    Dropout(p, dims = :)
+    Dropout(p, dims=:)
 
-A Dropout layer. In the forward pass, applies the [`dropout`](@ref) function on the input.
+Dropout layer. In the forward pass, apply the [`Flux.dropout`](@ref) function on the input.
 
-Does nothing to the input once [`testmode!`](@ref) is true.
+Does nothing to the input once [`Flux.testmode!`](@ref) is `true`.
 """
 mutable struct Dropout{F,D}
   p::F
@@ -40,20 +59,17 @@ mutable struct Dropout{F,D}
   active::Union{Bool, Nothing}
 end
 
-# TODO: deprecate in v0.11
-Dropout(p, dims) = Dropout(p, dims, nothing)
-
-function Dropout(p; dims = :)
+function Dropout(p; dims=:)
   @assert 0 ≤ p ≤ 1
-  Dropout{typeof(p),typeof(dims)}(p, dims, nothing)
+  Dropout(p, dims, nothing)
 end
 
 function (a::Dropout)(x)
   _isactive(a) || return x
-  return dropout(x, a.p; dims = a.dims)
+  return dropout(x, a.p; dims = a.dims, active=true)
 end
 
-testmode!(m::Dropout, mode = true) =
+testmode!(m::Dropout, mode=true) =
   (m.active = (isnothing(mode) || mode == :auto) ? nothing : !mode; m)
 
 function Base.show(io::IO, d::Dropout)
@@ -64,10 +80,11 @@ end
 
 """
     AlphaDropout(p)
-    
-A dropout layer. It is used in Self-Normalizing Neural Networks.
-(https://papers.nips.cc/paper/6698-self-normalizing-neural-networks.pdf)
-The AlphaDropout layer ensures that mean and variance of activations remains the same as before.
+
+A dropout layer. Used in
+[Self-Normalizing Neural Networks](https://arxiv.org/abs/1706.02515).
+The AlphaDropout layer ensures that mean and variance of activations
+remain the same as before.
 
 Does nothing to the input once [`testmode!`](@ref) is true.
 """
@@ -99,9 +116,9 @@ testmode!(m::AlphaDropout, mode = true) =
 """
     LayerNorm(h::Integer)
 
-A [normalisation layer](https://arxiv.org/pdf/1607.06450.pdf) designed to be
-used with recurrent hidden states of size `h`. Normalises the mean/stddev of
-each input before applying a per-neuron gain/bias.
+A [normalisation layer](https://arxiv.org/abs/1607.06450) designed to be
+used with recurrent hidden states of size `h`. Normalises the mean and standard
+deviation of each input before applying a per-neuron gain/bias.
 """
 struct LayerNorm{T}
   diag::Diagonal{T}
@@ -112,7 +129,7 @@ LayerNorm(h::Integer) =
 
 @functor LayerNorm
 
-(a::LayerNorm)(x) = a.diag(normalise(x))
+(a::LayerNorm)(x) = a.diag(normalise(x, dims=1))
 
 function Base.show(io::IO, l::LayerNorm)
   print(io, "LayerNorm(", length(l.diag.α), ")")
@@ -123,8 +140,8 @@ end
               initβ = zeros, initγ = ones,
               ϵ = 1e-8, momentum = .1)
 
-Batch Normalization layer. The `channels` input should be the size of the
-channel dimension in your data (see below).
+[Batch Normalization](https://arxiv.org/abs/1502.03167) layer.
+`channels` should be the size of the channel dimension in your data (see below).
 
 Given an array with `N` dimensions, call the `N-1`th the channel dimension. (For
 a batch of feature vectors this is just the data dimension, for `WHCN` images
@@ -136,10 +153,7 @@ per-channel `bias` and `scale` parameters).
 
 Use [`testmode!`](@ref) during inference.
 
-See [Batch Normalization: Accelerating Deep Network Training by Reducing
-Internal Covariate Shift](https://arxiv.org/pdf/1502.03167.pdf).
-
-Example:
+# Examples
 ```julia
 m = Chain(
   Dense(28^2, 64),
@@ -159,9 +173,6 @@ mutable struct BatchNorm{F,V,W,N}
   momentum::N
   active::Union{Bool, Nothing}
 end
-
-# TODO: deprecate in v0.11
-BatchNorm(λ, β, γ, μ, σ², ϵ, momentum) = BatchNorm(λ, β, γ, μ, σ², ϵ, momentum, nothing)
 
 BatchNorm(chs::Integer, λ = identity;
           initβ = (i) -> zeros(Float32, i), initγ = (i) -> ones(Float32, i), ϵ = 1f-5, momentum = 0.1f0) =
@@ -213,37 +224,6 @@ function Base.show(io::IO, l::BatchNorm)
   print(io, ")")
 end
 
-
-"""
-    InstanceNorm(channels::Integer, σ = identity;
-                 initβ = zeros, initγ = ones,
-                 ϵ = 1e-8, momentum = .1)
-
-Instance Normalization layer. The `channels` input should be the size of the
-channel dimension in your data (see below).
-
-Given an array with `N` dimensions, call the `N-1`th the channel dimension. (For
-a batch of feature vectors this is just the data dimension, for `WHCN` images
-it's the usual channel dimension.)
-
-`InstanceNorm` computes the mean and variance for each each `W×H×1×1` slice and
-shifts them to have a new mean and variance (corresponding to the learnable,
-per-channel `bias` and `scale` parameters).
-
-Use [`testmode!`](@ref) during inference.
-
-See [Instance Normalization: The Missing Ingredient for Fast Stylization](https://arxiv.org/abs/1607.08022).
-
-Example:
-```julia
-m = Chain(
-  Dense(28^2, 64),
-  InstanceNorm(64, relu),
-  Dense(64, 10),
-  InstanceNorm(10),
-  softmax)
-```
-"""
 expand_inst = (x, as) -> reshape(repeat(x, outer=[1, as[length(as)]]), as...)
 
 mutable struct InstanceNorm{F,V,W,N}
@@ -257,9 +237,34 @@ mutable struct InstanceNorm{F,V,W,N}
   active::Union{Bool, Nothing}
 end
 
-# TODO: deprecate in v0.11
-InstanceNorm(λ, β, γ, μ, σ², ϵ, momentum) = InstanceNorm(λ, β, γ, μ, σ², ϵ, momentum, nothing)
+"""
+    InstanceNorm(channels::Integer, σ = identity;
+                 initβ = zeros, initγ = ones,
+                 ϵ = 1e-8, momentum = .1)
 
+[Instance Normalization](https://arxiv.org/abs/1607.08022) layer.
+`channels` should be the size of the channel dimension in your data (see below).
+
+Given an array with `N` dimensions, call the `N-1`th the channel dimension. (For
+a batch of feature vectors this is just the data dimension, for `WHCN` images
+it's the usual channel dimension.)
+
+`InstanceNorm` computes the mean and variance for each each `W×H×1×1` slice and
+shifts them to have a new mean and variance (corresponding to the learnable,
+per-channel `bias` and `scale` parameters).
+
+Use [`testmode!`](@ref) during inference.
+
+# Examples
+```julia
+m = Chain(
+  Dense(28^2, 64),
+  InstanceNorm(64, relu),
+  Dense(64, 10),
+  InstanceNorm(10),
+  softmax)
+```
+"""
 InstanceNorm(chs::Integer, λ = identity;
           initβ = (i) -> zeros(Float32, i), initγ = (i) -> ones(Float32, i), ϵ = 1f-5, momentum = 0.1f0) =
   InstanceNorm(λ, initβ(chs), initγ(chs),
@@ -316,28 +321,27 @@ function Base.show(io::IO, l::InstanceNorm)
 end
 
 """
-Group Normalization.
-This layer can outperform Batch-Normalization and Instance-Normalization.
+    GroupNorm(chs::Integer, G::Integer, λ = identity;
+              initβ = (i) -> zeros(Float32, i), initγ = (i) -> ones(Float32, i),
+              ϵ = 1f-5, momentum = 0.1f0)
 
-	GroupNorm(chs::Integer, G::Integer, λ = identity;
-	          initβ = (i) -> zeros(Float32, i), initγ = (i) -> ones(Float32, i),
-	          ϵ = 1f-5, momentum = 0.1f0)
+[Group Normalization](https://arxiv.org/abs/1803.08494) layer.
+This layer can outperform Batch Normalization and Instance Normalization.
 
-``chs`` is the number of channels, the channel dimension of your input.
-For an array of N dimensions, the (N-1)th index is the channel dimension.
+`chs` is the number of channels, the channel dimension of your input.
+For an array of N dimensions, the `N-1`th index is the channel dimension.
 
-``G`` is the number of groups along which the statistics would be computed.
+`G` is the number of groups along which the statistics are computed.
 The number of channels must be an integer multiple of the number of groups.
 
 Use [`testmode!`](@ref) during inference.
 
-Example:
-```
+# Examples
+```julia
 m = Chain(Conv((3,3), 1=>32, leakyrelu;pad = 1),
-          GroupNorm(32,16)) # 32 channels, 16 groups (G = 16), thus 2 channels per group used
+          GroupNorm(32,16))
+          # 32 channels, 16 groups (G = 16), thus 2 channels per group used
 ```
-
-Link : https://arxiv.org/pdf/1803.08494.pdf
 """
 mutable struct GroupNorm{F,V,W,N,T}
   G::T # number of groups
@@ -350,9 +354,6 @@ mutable struct GroupNorm{F,V,W,N,T}
   momentum::N
   active::Union{Bool, Nothing}
 end
-
-# TODO: deprecate in v0.11
-GroupNorm(G, λ, β, γ, μ, σ², ϵ, momentum) = GroupNorm(G, λ, β, γ, μ, σ², ϵ, momentum, nothing)
 
 GroupNorm(chs::Integer, G::Integer, λ = identity;
           initβ = (i) -> zeros(Float32, i), initγ = (i) -> ones(Float32, i), ϵ = 1f-5, momentum = 0.1f0) =
